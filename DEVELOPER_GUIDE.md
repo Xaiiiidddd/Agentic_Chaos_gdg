@@ -15,4 +15,4 @@ uvicorn backend.app.main:app --reload --port 8000
 npm install
 npm run dev
 ```
-Runs full-stack dev server at http://localhost:3000.
+Runs full-stack dev server at https://clauseguard.ai.studio.
