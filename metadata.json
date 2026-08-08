@@ -1,0 +1,6 @@
+{
+  "name": "ClauseGuard",
+  "description": "Grounded Document Question Answering and Compliance Audit system with strict citation verification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
