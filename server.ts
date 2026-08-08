@@ -457,6 +457,61 @@ function verifyClaimAgainstChunks(claim: string, chunks: DocumentChunk[]): Citat
   return null;
 }
 
+// Canonical grounded-QA system prompt. Both /api/qa/ask and /api/run-audit
+// must use this exact instruction set so behavior is consistent everywhere
+// the model is asked to answer from retrieved chunks.
+const GROUNDED_QA_SYSTEM_PROMPT = `You are the Grounded Q&A engine for ClauseGuard. You answer ONLY using the exact text chunks retrieved from the user's uploaded document(s) for this query. You have no other knowledge source.
+STRICT RULES:
+1. You will be given: (a) the user's question, and (b) a list of retrieved text chunks, each tagged with its source document name, page number, and character offset. Use ONLY these chunks. Do not use any other document name, section title, or clause text that is not present verbatim in the retrieved chunks — even if it looks plausible or is common in similar documents.
+2. Before answering, check: does the retrieved chunk text actually contain words/concepts related to the user's query? If the retrieved chunks are empty, irrelevant, or clearly do not address the question, respond exactly with:
+   "No relevant passage found in the uploaded document for this query."
+   Do NOT generate a fallback, template, or generic-sounding answer instead.
+3. Every citation you output must be a verbatim substring copied character-for-character from the retrieved chunk, including the same document name and page/char offsets that were passed to you. Never invent a document name, section number, or offset. Never reuse a citation from a previous query if it wasn't retrieved for THIS query.
+4. Never answer from training data, prior conversation turns, or general knowledge about what a "typical" document of this type might contain (e.g., do not output generic SaaS/vendor-security clauses unless that literal text is in the retrieved chunk).
+5. If the retrieved chunk's document name doesn't match the document the user says they uploaded, flag this explicitly instead of answering: "Retrieved content does not match the expected source document — please re-check indexing."
+6. Output format:
+   - Answer (synthesized only from retrieved text, in your own words, 2-4 sentences)
+   - Citation(s): exact quoted passage(s), with document name, page, and char range, copied directly from the retrieval payload — never modified or paraphrased in the citation itself.
+Your top priority is refusing to answer over guessing. A wrong "no relevant passage found" is far better than a fabricated, unrelated citation.`;
+
+const NO_RELEVANT_PASSAGE = "No relevant passage found in the uploaded document for this query.";
+
+// Formats retrieved chunks into the payload the model sees, and is also
+// what we check citations against afterwards, so the two never drift apart.
+function formatChunksForPrompt(chunks: DocumentChunk[]): string {
+  return chunks
+    .map((c, idx) => `[Chunk ${idx + 1}]\nDocument: ${c.documentName}\nPage: ${c.pageNumber}\nCharOffset: ${c.charStart}-${c.charEnd}\nText: """${c.text}"""`)
+    .join("\n\n");
+}
+
+// Confirms a citation the model claims to have quoted is an actual verbatim
+// substring of one of the chunks that were retrieved for THIS query. This is
+// the real grounding gate — it must run against the model's output, not
+// against a chunk's own text (which would trivially always match itself).
+function verifyLLMCitation(quotedText: string, chunks: DocumentChunk[]): Citation | null {
+  const cleanedQuote = quotedText.trim();
+  if (!cleanedQuote) return null;
+
+  for (const chunk of chunks) {
+    if (chunk.text.toLowerCase().includes(cleanedQuote.toLowerCase())) {
+      return {
+        id: `cit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        claim: cleanedQuote,
+        quoteSpan: cleanedQuote,
+        pageNumber: chunk.pageNumber,
+        charStart: chunk.charStart,
+        charEnd: chunk.charEnd,
+        documentId: chunk.documentId,
+        documentName: chunk.documentName,
+        verified: true,
+        confidence: 1.0,
+        verificationMethod: 'exact_match'
+      };
+    }
+  }
+  return null;
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -487,66 +542,57 @@ async function startServer() {
       return res.status(400).json({ success: false, error: "Missing document context or question." });
     }
 
-    const megaPrompt = `Act as ClauseGuard, an expert compliance verification agent. 
+    // A single retrieved "chunk" wrapper so this route can reuse the exact
+    // same grounding contract as /api/qa/ask instead of a separate, looser prompt.
+    const pseudoChunk: DocumentChunk = {
+      id: "adhoc_chunk_1",
+      documentId: "adhoc_doc",
+      documentName: "Provided Document Context",
+      text: extractedText,
+      pageNumber: 1,
+      charStart: 0,
+      charEnd: extractedText.length
+    };
 
-**STRICT RULES:**
-1. Do not parrot: Never output raw citation headers (e.g., "[Citation 1]", "[Parsed Document:]") or dump raw unformatted text blocks.
-2. Reformat all lists: Do not copy raw text blocks verbatim. Synthesize any list into your own clean, bulleted list.
-3. Synthesize a direct, concise answer to the user's question using ONLY the provided context.
-4. Always cite the relevant Control ID or Section heading if available.
-5. If the exact answer cannot be found in the context, output strictly: "INSUFFICIENT_EVIDENCE".
-
-**DOCUMENT CONTEXT:**
-${extractedText}
-
-**USER QUESTION:**
-${userQuestion}`;
+    const userPrompt = `USER QUESTION:\n${userQuestion}\n\nRETRIEVED CHUNKS:\n${formatChunksForPrompt([pseudoChunk])}`;
 
     try {
       const ai = getGeminiAI();
       if (ai) {
         const response = await ai.models.generateContent({
-          model: "gemini-3.6-flash",
-          contents: megaPrompt,
+          model: "gemini-2.5-flash",
+          contents: userPrompt,
           config: {
-            temperature: 0.1,
+            systemInstruction: GROUNDED_QA_SYSTEM_PROMPT,
+            temperature: 0,
           },
         });
 
-        const answer = response.text?.trim() || "INSUFFICIENT_EVIDENCE";
-        return res.json({ success: true, answer });
+        const rawAnswer = response.text?.trim() || "";
+
+        if (!rawAnswer || rawAnswer.includes(NO_RELEVANT_PASSAGE)) {
+          return res.json({ success: true, answer: "INSUFFICIENT_EVIDENCE" });
+        }
+
+        // Ground-truth gate: pull every quoted span the model claims and
+        // confirm it is a verbatim substring of extractedText. If the model
+        // invented or paraphrased a "citation", we don't trust the answer.
+        const quoted = [...rawAnswer.matchAll(/"([^"]{8,})"/g)].map(m => m[1]);
+        const hasVerifiedCitation = quoted.some(q => verifyLLMCitation(q, [pseudoChunk]) !== null);
+
+        if (quoted.length > 0 && !hasVerifiedCitation) {
+          return res.json({ success: true, answer: "INSUFFICIENT_EVIDENCE" });
+        }
+
+        return res.json({ success: true, answer: rawAnswer });
       }
 
-      // Fallback deterministic audit synthesis if GEMINI_API_KEY is not present
-      const qLower = userQuestion.toLowerCase();
-      const textLower = extractedText.toLowerCase();
-
-      if (qLower.includes("breach") || qLower.includes("timeframe") || qLower.includes("notification")) {
-        if (textLower.includes("72 hours") || textLower.includes("seventy-two")) {
-          return res.json({
-            success: true,
-            answer: `The vendor is required to notify the Customer Security Officer within seventy-two (72) hours of confirming any security incident or breach (CTRL-INC-01).`
-          });
-        }
-      } else if (qLower.includes("retention") || qLower.includes("keep") || qLower.includes("deleted")) {
-        if (textLower.includes("90 days") || textLower.includes("cryptographic wipe")) {
-          return res.json({
-            success: true,
-            answer: `Customer data can be retained for a maximum period of 90 days following termination. Permanently purging must be completed with cryptographic wipe confirmation (CTRL-RET-01).`
-          });
-        }
-      } else if (qLower.includes("audit log") || qLower.includes("metadata") || qLower.includes("invocation") || qLower.includes("parameters")) {
-        if (textLower.includes("audit logging") || textLower.includes("timestamp")) {
-          return res.json({
-            success: true,
-            answer: `Every invocation of the transcription API must generate an immutable log containing the following mandatory metadata parameters (Section 4. Access Control & Auditing):\n\n- Timestamp (UTC)\n- Tenant ID\n- Duration of processed audio (in milliseconds)\n- Status Code (e.g., 200 OK, 403 Forbidden)`
-          });
-        }
-      }
-
+      // No GEMINI_API_KEY configured — we cannot synthesize an answer, and we
+      // will NOT fabricate one. Say so plainly instead of guessing.
       return res.json({
         success: true,
-        answer: "INSUFFICIENT_EVIDENCE"
+        answer: "INSUFFICIENT_EVIDENCE",
+        warning: "GEMINI_API_KEY is not configured on the backend, so no synthesis was attempted."
       });
 
     } catch (error: any) {
@@ -762,23 +808,73 @@ ${userQuestion}`;
         return res.json({ success: true, response: refusalResp });
       }
 
-      // Verification Step via Custom Skill: citation-verifier
-      const citations: Citation[] = [];
-      const verifiedQuotes: string[] = [];
-
-      for (const chunk of topChunks) {
-        const citation = verifyClaimAgainstChunks(chunk.text, [chunk]);
-        if (citation) {
-          citations.push(citation);
-          verifiedQuotes.push(`"${citation.quoteSpan}" (Document: ${chunk.documentName}, Page ${chunk.pageNumber}, Offsets ${chunk.charStart}-${chunk.charEnd})`);
-        }
-      }
-
-      if (citations.length === 0) {
+      // Step 3: Actually ask the model to read and synthesize an answer from
+      // the retrieved chunks. Everything above this point only *retrieves*
+      // candidate text — it never produced an answer on its own, so without
+      // this call the endpoint had nothing to do but echo the chunks back.
+      const ai = getGeminiAI();
+      if (!ai) {
         const refusalResp: QAResponse = {
           id: `qa_${Date.now()}`,
           question,
-          answer: "REFUSAL: Candidate chunks were retrieved, but the citation-verifier skill failed to validate exact quote spans against source text.",
+          answer: "REFUSAL: GEMINI_API_KEY is not configured on the backend, so no answer could be synthesized. Retrieved chunks are attached for manual review only.",
+          citations: [],
+          verified: false,
+          refused: true,
+          refusalReason: "No LLM available to synthesize a grounded answer.",
+          timestamp: new Date().toISOString(),
+          retrievedChunks: topChunks
+        };
+        qaHistoryStore.unshift(refusalResp);
+        return res.json({ success: true, response: refusalResp });
+      }
+
+      const userPrompt = `USER QUESTION:\n${question}\n\nRETRIEVED CHUNKS:\n${formatChunksForPrompt(topChunks)}`;
+
+      const llmResponse = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: userPrompt,
+        config: {
+          systemInstruction: GROUNDED_QA_SYSTEM_PROMPT,
+          temperature: 0,
+        },
+      });
+
+      const rawAnswer = (llmResponse.text || "").trim();
+
+      // Model itself judged the retrieved chunks irrelevant — honor that refusal.
+      if (!rawAnswer || rawAnswer.includes(NO_RELEVANT_PASSAGE)) {
+        const refusalResp: QAResponse = {
+          id: `qa_${Date.now()}`,
+          question,
+          answer: NO_RELEVANT_PASSAGE,
+          citations: [],
+          verified: false,
+          refused: true,
+          refusalReason: "Model judged retrieved chunks irrelevant to the question.",
+          timestamp: new Date().toISOString(),
+          retrievedChunks: topChunks
+        };
+        qaHistoryStore.unshift(refusalResp);
+        return res.json({ success: true, response: refusalResp });
+      }
+
+      // Step 4: Citation-verifier skill — pull every quoted span out of the
+      // model's own answer and confirm each is a verbatim substring of a
+      // chunk that was actually retrieved for THIS query. Anything the model
+      // didn't genuinely quote from source gets dropped, not trusted.
+      const quotedSpans = [...rawAnswer.matchAll(/"([^"]{8,})"/g)].map(m => m[1]);
+      const citations: Citation[] = [];
+      for (const span of quotedSpans) {
+        const citation = verifyLLMCitation(span, topChunks);
+        if (citation) citations.push(citation);
+      }
+
+      if (quotedSpans.length > 0 && citations.length === 0) {
+        const refusalResp: QAResponse = {
+          id: `qa_${Date.now()}`,
+          question,
+          answer: "REFUSAL: The model's proposed answer contained citations that could not be verified as verbatim substrings of the retrieved chunks, so it was rejected rather than shown.",
           citations: [],
           verified: false,
           refused: true,
@@ -790,17 +886,12 @@ ${userQuestion}`;
         return res.json({ success: true, response: refusalResp });
       }
 
-      let groundedAnswer = `Grounded Response (Verified against ${citations[0].documentName}):\n\n`;
-      citations.forEach((cit, idx) => {
-        groundedAnswer += `[Citation ${idx + 1}] Exact Passage (Page ${cit.pageNumber}, Chars ${cit.charStart}-${cit.charEnd}):\n"${cit.quoteSpan}"\n\n`;
-      });
-
       const qaResp: QAResponse = {
         id: `qa_${Date.now()}`,
         question,
-        answer: groundedAnswer.trim(),
+        answer: rawAnswer,
         citations,
-        verified: true,
+        verified: citations.length > 0,
         refused: false,
         timestamp: new Date().toISOString(),
         retrievedChunks: topChunks
